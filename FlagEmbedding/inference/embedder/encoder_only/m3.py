@@ -1,4 +1,5 @@
 import math
+import os
 import torch
 import queue
 import logging
@@ -686,12 +687,22 @@ class M3Embedder(AbsEmbedder):
             p_dense_vecs, p_sparse_vecs, p_colbert_vecs = corpus_output['dense_vecs'], corpus_output['sparse_vecs'], \
             corpus_output['colbert_vecs']
 
-            dense_scores = self.model.compute_dense_score(q_dense_vecs, p_dense_vecs)
-            sparse_scores = self.model.compute_sparse_score(q_sparse_vecs, p_sparse_vecs)
-            colbert_scores = self.model.compute_colbert_score(
-                q_colbert_vecs, p_colbert_vecs,
-                q_mask=queries_inputs['attention_mask']
-            )
+            # Each row is paired with the passage at the same batch index.
+            dense_scores = torch.bmm(
+                q_dense_vecs.unsqueeze(1), p_dense_vecs.unsqueeze(-1)
+            ).flatten()
+            sparse_scores = torch.bmm(
+                q_sparse_vecs.unsqueeze(1), p_sparse_vecs.unsqueeze(-1)
+            ).flatten()
+            query_lengths = queries_inputs['attention_mask'][:, 1:].sum(-1)
+            # Include zero-padded passage positions in MaxSim, as in the all-pairs scorer.
+            max_token_scores = self._colbert_token_maxima(q_colbert_vecs, p_colbert_vecs)
+            colbert_scores = max_token_scores.sum(-1) / query_lengths
+
+            temperature = self.model.temperature
+            dense_scores = (dense_scores / temperature).float()
+            sparse_scores = (sparse_scores / temperature).float()
+            colbert_scores = (colbert_scores / temperature).float()
 
             if weights_for_different_modes is None:
                 weights_for_different_modes = [1., 1., 1.]
@@ -700,10 +711,6 @@ class M3Embedder(AbsEmbedder):
             else:
                 assert len(weights_for_different_modes) == 3
                 weight_sum = sum(weights_for_different_modes)
-
-            inx = torch.arange(0, len(sentences_batch))
-            dense_scores, sparse_scores, colbert_scores = dense_scores[inx, inx].float(), sparse_scores[
-                inx, inx].float(), colbert_scores[inx, inx].float()
 
             all_scores['colbert'].extend(
                 self._convert_to_numpy(colbert_scores, device=device).tolist()
@@ -733,6 +740,34 @@ class M3Embedder(AbsEmbedder):
         if one_input_pair:
             return {k: v[0] for k, v in all_scores.items()}
         return all_scores
+
+    @staticmethod
+    def _colbert_token_maxima(queries: torch.Tensor, passages: torch.Tensor) -> torch.Tensor:
+        if (
+            os.getenv("FLAGEMBEDDING_M3_TRITON") == "1"
+            and queries.is_cuda
+            and torch.version.cuda is not None
+            and not torch.is_autocast_enabled()
+            and queries.numel() > 0
+            and passages.numel() > 0
+            and queries.dtype == passages.dtype
+            and queries.dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and torch.cuda.get_device_capability(queries.device)[0] >= 8
+        ):
+            try:
+                from ._m3_triton import colbert_token_maxima
+            except ModuleNotFoundError as exc:
+                if exc.name != "triton":
+                    raise
+            else:
+                return colbert_token_maxima(queries, passages)
+
+        passage_tiles = iter(passages.transpose(1, 2).split(512, dim=-1))
+        max_token_scores = torch.bmm(queries, next(passage_tiles)).amax(dim=-1)
+        for passage_tile in passage_tiles:
+            tile_max_scores = torch.bmm(queries, passage_tile).amax(dim=-1)
+            max_token_scores = torch.maximum(max_token_scores, tile_max_scores)
+        return max_token_scores
 
     def _concatenate_results_from_multi_process(
         self,
